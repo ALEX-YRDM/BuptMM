@@ -6,21 +6,23 @@ import json
 import glob
 import cv2
 import numpy as np
+import torch.nn.functional as F
 
 from pprint import pprint
 from utils.model_summary import get_model_activation, get_model_flops
 from utils import utils_logger
 from utils import utils_image as util
+from utils import utils_canny as canny
 
 
 def select_model(args, device):
     # Model ID is assigned according to the order of the submissions.
     # Different networks are trained with input range of either [0,1] or [0,255]. The range is determined manually.
     model_id = args.model_id
-    if model_id == 0:
+    if model_id == 4:
         # SGN test
         # from models.team00_SGN import SGNDN3
-        name, data_range = f"{model_id:02}_B_baseline", 1.0
+        name, data_range = f"{model_id:02}_DDU_baseline", 1.0
         # model_path = os.path.join('model_zoo', 'team00_sgn.ckpt')
         # model = SGNDN3()
         #
@@ -33,7 +35,7 @@ def select_model(args, device):
         #     if k.find("model.") >= 0:
         #         new_state_dict[k.replace("model.", "")] = v
         # model.load_state_dict(new_state_dict, strict=True)
-        from models.team04_DDU import HAT_v1,RestormerLocal
+        from models.team04_DDU import HAT_v1, RestormerLocal
         hat_model_path = os.path.join('model_zoo', 'team04_DDU_0.pth')
         rsm_model_path = os.path.join('model_zoo', 'team04_DDU_1.pth')
         hat = HAT_v1()
@@ -45,7 +47,7 @@ def select_model(args, device):
 
     # print(model)
     hat.eval()
-    tile = None
+    tile = 512
     for k, v in hat.named_parameters():
         v.requires_grad = False
     hat = hat.to(device)
@@ -54,7 +56,7 @@ def select_model(args, device):
     for k, v in rsm.named_parameters():
         v.requires_grad = False
     rsm = rsm.to(device)
-    return [hat,rsm],name,data_range,tile
+    return [hat, rsm], name, data_range, tile
 
 
 def select_dataset(data_dir, mode):
@@ -63,7 +65,7 @@ def select_dataset(data_dir, mode):
             (
                 os.path.join(data_dir, f"DIV2K_test_noise50/{i:04}.png"),
                 os.path.join(data_dir, f"DIV2K_test_HR/{i:04}.png")
-            ) for i in range(901, 1001)
+            ) for i in range(901, 910)
         ]
         # [f"DIV2K_test_LR/{i:04}.png" for i in range(901, 1001)]
     elif mode == "valid":
@@ -71,7 +73,7 @@ def select_dataset(data_dir, mode):
             (
                 os.path.join(data_dir, f"DIV2K_valid_noise50/{i:04}.png"),
                 os.path.join(data_dir, f"DIV2K_valid_HR/{i:04}.png")
-            ) for i in range(801, 901)
+            ) for i in range(801, 810)
         ]
     elif mode == "hybrid_test":
         path = [
@@ -85,50 +87,72 @@ def select_dataset(data_dir, mode):
     return path
 
 
-def forward(img_lq, model, tile=None, tile_overlap=32, scale=1):
-    if tile is None:
-        # test the image as a whole
-        output0 = model[0](img_lq)
-        output1 = model[1](img_lq)
-        output0 = output0.numpy()
-        output1 = output1.numpy()
-        edges_lq = cv2.Canny(output0, 280, 300)
-        edges_mi = cv2.Canny(output1, 280, 300)
-        enhance = cv2.bitwise_or(edges_mi, edges_lq)
-        enhance = cv2.bitwise_xor(edges_mi, enhance)
-        mask = (enhance == 255)
-        mask = ~mask
-        output0[mask] = output1[mask].astype(np.float32) * 0.5 + output0[mask].astype(np.float32) * 0.5
-        output = torch.tensor(output0.astype(np.uint8))
+def forward(img_lq, model, tile=None, tile_overlap=128, scale=1):
+    # test the image as a whole
+    # output0 = model[0](img_lq)
 
+    # HAT推理
+    b, c, h, w = img_lq.size()
+    tile = min(tile, h, w)
+    tile_overlap = tile_overlap
+    sf = scale
+
+    stride = tile - tile_overlap
+    h_idx_list = list(range(0, h - tile, stride)) + [h - tile]
+    w_idx_list = list(range(0, w - tile, stride)) + [w - tile]
+    E0 = torch.zeros(b, c, h * sf, w * sf).type_as(img_lq)
+    W0 = torch.zeros_like(E0)
+
+    for h_idx in h_idx_list:
+        for w_idx in w_idx_list:
+            in_patch = img_lq[..., h_idx:h_idx + tile, w_idx:w_idx + tile]
+            out_patch0 = model[0](in_patch)
+            out_patch_mask0 = torch.ones_like(out_patch0)
+
+            E0[..., h_idx * sf:(h_idx + tile) * sf, w_idx * sf:(w_idx + tile) * sf].add_(out_patch0)
+            W0[..., h_idx * sf:(h_idx + tile) * sf, w_idx * sf:(w_idx + tile) * sf].add_(out_patch_mask0)
+    output0 = E0.div_(W0)
+    # Restormer推理，如果长边超过 MAX_SIZE，分割为左右两部分
+    if max(h, w) > 3000:
+        if w > h:
+            # 水平分割
+            left = img_lq[:, :, :, :w // 2]
+            right = img_lq[:, :, :, w // 2:]
+        else:
+            # 垂直分割
+            left = img_lq[:, :, :h // 2, :]
+            right = img_lq[:, :, h // 2:, :]
+
+        # 分别推理左右部分
+        def process_image_part(image_part, factor=8):
+            input_ = image_part
+
+            # Padding in case images are not multiples of 8
+            h_part, w_part = input_.shape[2], input_.shape[3]
+            H_part, W_part = ((h_part + factor) // factor) * factor, ((w_part + factor) // factor) * factor
+            padh = H_part - h_part if h_part % factor != 0 else 0
+            padw = W_part - w_part if w_part % factor != 0 else 0
+            input_ = F.pad(input_, (0, padw, 0, padh), 'reflect')
+
+            particial = model[1](input_)
+            particial = particial[:, :, :h_part, :w_part]
+            return particial
+
+        restored_left = process_image_part(left)
+        restored_right = process_image_part(right)
+
+        # 拼接左右部分
+        if w > h:
+            output1 = torch.cat([restored_left, restored_right], dim=3)
+        else:
+            output1 = torch.cat([restored_left, restored_right], dim=2)
     else:
-        # test the image tile by tile
-        b, c, h, w = img_lq.size()
-        tile = min(tile, h, w)
-        tile_overlap = tile_overlap
-        sf = scale
-
-        stride = tile - tile_overlap
-        h_idx_list = list(range(0, h-tile, stride)) + [h-tile]
-        w_idx_list = list(range(0, w-tile, stride)) + [w-tile]
-        E = torch.zeros(b, c, h*sf, w*sf).type_as(img_lq)
-        W = torch.zeros_like(E)
-
-        for h_idx in h_idx_list:
-            for w_idx in w_idx_list:
-                in_patch = img_lq[..., h_idx:h_idx+tile, w_idx:w_idx+tile]
-                out_patch = model(in_patch)
-                out_patch_mask = torch.ones_like(out_patch)
-
-                E[..., h_idx*sf:(h_idx+tile)*sf, w_idx*sf:(w_idx+tile)*sf].add_(out_patch)
-                W[..., h_idx*sf:(h_idx+tile)*sf, w_idx*sf:(w_idx+tile)*sf].add_(out_patch_mask)
-        output = E.div_(W)
-
+        output1 = model[1](img_lq)
+    output = canny.canny_process(output0, output1)
     return output
 
 
 def run(model, model_name, data_range, tile, logger, device, args, mode="test"):
-
     sf = 4
     border = sf
     results = dict()
@@ -201,23 +225,23 @@ def run(model, model_name, data_range, tile, logger, device, args, mode="test"):
         #     results[f"{mode}_psnr_y"].append(psnr_y)
         #     results[f"{mode}_ssim_y"].append(ssim_y)
         # print(os.path.join(save_path, img_name+ext))
-        util.imsave(img_dn, os.path.join(save_path, img_name+ext))
+        util.imsave(img_dn, os.path.join(save_path, img_name + ext))
 
     results[f"{mode}_memory"] = torch.cuda.max_memory_allocated(torch.cuda.current_device()) / 1024 ** 2
-    results[f"{mode}_ave_runtime"] = sum(results[f"{mode}_runtime"]) / len(results[f"{mode}_runtime"]) #/ 1000.0
+    results[f"{mode}_ave_runtime"] = sum(results[f"{mode}_runtime"]) / len(results[f"{mode}_runtime"])  # / 1000.0
     results[f"{mode}_ave_psnr"] = sum(results[f"{mode}_psnr"]) / len(results[f"{mode}_psnr"])
     if args.ssim:
         results[f"{mode}_ave_ssim"] = sum(results[f"{mode}_ssim"]) / len(results[f"{mode}_ssim"])
     # results[f"{mode}_ave_psnr_y"] = sum(results[f"{mode}_psnr_y"]) / len(results[f"{mode}_psnr_y"])
     # results[f"{mode}_ave_ssim_y"] = sum(results[f"{mode}_ssim_y"]) / len(results[f"{mode}_ssim_y"])
     logger.info("{:>16s} : {:<.3f} [M]".format("Max Memery", results[f"{mode}_memory"]))  # Memery
-    logger.info("------> Average runtime of ({}) is : {:.6f} seconds".format("test" if mode == "test" else "valid", results[f"{mode}_ave_runtime"]))
+    logger.info("------> Average runtime of ({}) is : {:.6f} seconds".format("test" if mode == "test" else "valid",
+                                                                             results[f"{mode}_ave_runtime"]))
 
     return results
 
 
 def main(args):
-
     utils_logger.logger_info("NTIRE2025-Dn50", log_path="NTIRE2025-Dn50.log")
     logger = logging.getLogger("NTIRE2025-Dn50")
 
@@ -266,18 +290,19 @@ def main(args):
 
         input_dim = (3, 256, 256)  # set the input dimension
         activations, num_conv = get_model_activation(model, input_dim)
-        activations = activations/10**6
+        activations = activations / 10 ** 6
         logger.info("{:>16s} : {:<.4f} [M]".format("#Activations", activations))
         logger.info("{:>16s} : {:<d}".format("#Conv2d", num_conv))
 
         flops = get_model_flops(model, input_dim, False)
-        flops = flops/10**9
+        flops = flops / 10 ** 9
         logger.info("{:>16s} : {:<.4f} [G]".format("FLOPs", flops))
 
         num_parameters = sum(map(lambda x: x.numel(), model.parameters()))
-        num_parameters = num_parameters/10**6
+        num_parameters = num_parameters / 10 ** 6
         logger.info("{:>16s} : {:<.4f} [M]".format("#Params", num_parameters))
-        results[model_name].update({"activations": activations, "num_conv": num_conv, "flops": flops, "num_parameters": num_parameters})
+        results[model_name].update(
+            {"activations": activations, "num_conv": num_conv, "flops": flops, "num_parameters": num_parameters})
 
         with open(json_dir, "w") as f:
             json.dump(results, f)
